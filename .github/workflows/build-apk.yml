@@ -100,10 +100,24 @@ jobs:
       - name: Bundle Piper offline voice (optional - the build continues if this fails)
         continue-on-error: true
         run: |
-          npm install --no-save --no-package-lock --no-audit --no-fund --legacy-peer-deps @mintplex-labs/piper-tts-web@1.0.4
-          npx esbuild piper-entry.js --bundle --format=esm --platform=browser --target=chrome90 --outfile=www/piper-bundle.js
+          PIPER=@mintplex-labs/piper-tts-web@1.0.4
+          npm install --no-save --no-package-lock --no-audit --no-fund --legacy-peer-deps "$PIPER"
+          # onnxruntime-web is a peer dependency: install the exact version the library loads its wasm from
+          ORT=$(grep -rhoE "onnxruntime-web[@/][0-9]+\.[0-9]+\.[0-9]+" node_modules/@mintplex-labs/piper-tts-web/dist 2>/dev/null | head -1 | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" || true)
+          if [ -z "$ORT" ]; then ORT=$(npm view "$PIPER" peerDependencies.onnxruntime-web 2>/dev/null || true); fi
+          if [ -z "$ORT" ]; then ORT=1.18.0; fi
+          echo "Using onnxruntime-web@$ORT"
+          # one single install so npm does not prune the first package
+          npm install --no-save --no-package-lock --no-audit --no-fund --legacy-peer-deps "$PIPER" "onnxruntime-web@$ORT"
+          # fs/path/etc. only appear inside Node-only branches of the emscripten glue; they never run in the WebView
+          npx esbuild piper-entry.js --bundle --format=esm --platform=browser --target=chrome90 \
+            --external:fs --external:path --external:os --external:crypto --external:worker_threads --external:perf_hooks \
+            --external:child_process --external:url --external:util --external:stream --external:http --external:https --external:zlib --external:node:* \
+            --outfile=www/piper-bundle.js
+          test -s www/piper-bundle.js
+          grep -q RCPiper www/piper-bundle.js
           ls -la www/piper-bundle.js
-          echo "Piper bundle created." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Piper bundle created (onnxruntime-web $ORT)." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Add Android platform
         run: npx cap add android
