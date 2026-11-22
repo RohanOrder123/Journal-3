@@ -83,11 +83,17 @@
   /* ---------- Piper (free, offline neural voice; model is downloaded once and kept on the phone) ---------- */
   const PDEF = { en: 'en_US-hfc_female-medium', hi: 'hi_IN-priyamvada-medium' };
   const piper = function () { return window.RCPiper || null; };
+  /* Capacitor patches fetch() and turns binary bodies (the 60 MB model, wasm) into text. While Piper works, use the real WebView fetch. */
+  async function realFetch(fn) {
+    const orig = window.fetch, real = window.CapacitorWebFetch;
+    if (real) window.fetch = real.bind(window);
+    try { return await fn(); } finally { window.fetch = orig; }
+  }
   let pvoices = null, pwarned = '';
   const perr = function (code, m) { const e = new Error(m || code); e.pcode = code; return e; };
   async function pList() {
     if (pvoices) return pvoices;
-    const v = await piper().voices();
+    const v = await realFetch(function () { return piper().voices(); });
     pvoices = Array.isArray(v) ? v.map(function (x) { return x.key || x.id || String(x); }) : Object.keys(v || {});
     return pvoices;
   }
@@ -106,7 +112,7 @@
   }
   async function pSynth(chunk, id) {
     const k = id + '|' + chunk; if (pcache.has(k)) return pcache.get(k);
-    const w = await piper().predict({ text: chunk, voiceId: id });
+    const w = await realFetch(function () { return piper().predict({ text: chunk, voiceId: id }); });
     const b = new Blob([w], { type: 'audio/wav' });
     pcache.set(k, b); if (pcache.size > 40) pcache.delete(pcache.keys().next().value);
     return b;
@@ -328,6 +334,8 @@
       '<div style="border:1px solid #374151;border-radius:12px;padding:10px;margin:6px 0 10px"><b>Piper voices</b><div id="vp-pst" style="opacity:.8;margin:4px 0">Checking...</div>' +
       '<label>Hindi voice</label><select id="vp-phi" style="width:100%;padding:10px;margin:4px 0 6px;border-radius:10px"></select><button id="vp-pdhi" style="width:100%;padding:10px;border-radius:10px;margin-bottom:8px">Download Hindi voice (about 60 MB, once)</button>' +
       '<label>English voice</label><select id="vp-pen" style="width:100%;padding:10px;margin:4px 0 6px;border-radius:10px"></select><button id="vp-pden" style="width:100%;padding:10px;border-radius:10px;margin-bottom:8px">Download English voice (about 60 MB, once)</button>' +
+      '<div id="vp-bar" style="height:10px;background:#374151;border-radius:6px;overflow:hidden;margin:6px 0;display:none"><div id="vp-fill" style="height:100%;width:0;background:#22c55e;transition:width .3s"></div></div>' +
+      '<div id="vp-pdet" style="font-size:13px;min-height:18px;margin:2px 0 8px"></div>' +
       '<button id="vp-ptest" style="width:100%;padding:10px;border-radius:10px">Test Piper</button></div>' +
       '<label>ElevenLabs API key</label><input id="vp-key" type="password" autocomplete="off" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px">' +
       '<label>Voice ID (optional - leave empty to use the default voice)</label><input id="vp-vid" autocomplete="off" placeholder="e.g. 21m00Tcm4TlvDq8ikWAM" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px">' +
@@ -376,20 +384,37 @@
         await refresh();
       } catch (e) { st.textContent = 'Could not load the voice list (needs internet once): ' + (e && e.message); }
       const dl = function (sel) { return async function () {
-        store(); const id = $(sel).value; if (!id) return msg('Pick a voice first.');
-        try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* best effort */ }
-        msg('Downloading ' + id + ' ...');
-        try { await P.download(id, function (g) { if (g && g.total) msg('Downloading ' + id + ': ' + Math.round(g.loaded * 100 / g.total) + '%'); }); msg('Downloaded. Press Test Piper.'); await refresh(); }
-        catch (e) { msg('Download failed: ' + ((e && e.message) || 'no internet?')); }
+        store(); const id = $(sel).value; if (!id) { $('vp-pdet').textContent = 'Pick a voice first.'; return; }
+        const bar = $('vp-bar'), fill = $('vp-fill'), det = $('vp-pdet'), btns = [$('vp-pdhi'), $('vp-pden')];
+        const note = function (t) { det.textContent = t; msg(t); };
+        btns.forEach(function (b) { b.disabled = true; }); bar.style.display = 'block'; fill.style.background = '#22c55e'; fill.style.width = '3%';
+        if (det.scrollIntoView) det.scrollIntoView({ block: 'center' });
+        let last = Date.now(); const files = {};
+        const tick = setInterval(function () { const sec = Math.round((Date.now() - last) / 1000); if (sec >= 10) det.textContent = 'Waiting for the server... ' + sec + 's with no data. Check your internet or access to huggingface.co. (Still trying)'; }, 3000);
+        try {
+          if (!(navigator.storage && navigator.storage.getDirectory)) throw new Error('this phone WebView has no offline file storage (OPFS) that Piper needs');
+          try { if (navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* best effort */ }
+          note('Starting download of ' + id + ' ...');
+          await realFetch(function () { return P.download(id, function (g) {
+            last = Date.now(); if (g && g.url) files[g.url] = g;
+            let l = 0, t = 0; Object.keys(files).forEach(function (u) { l += files[u].loaded || 0; t += files[u].total || 0; });
+            const pct = t ? Math.min(99, Math.round(l * 100 / t)) : null; fill.style.width = (pct || 6) + '%';
+            det.textContent = 'Downloading ' + id + ': ' + (pct === null ? (l / 1048576).toFixed(1) + ' MB' : pct + '% (' + (l / 1048576).toFixed(1) + ' of ' + (t / 1048576).toFixed(1) + ' MB)');
+          }); });
+          const stored = (await P.stored()) || [];
+          if (stored.indexOf(id) < 0) throw new Error('the download ended but the voice was not saved (storage problem)');
+          fill.style.width = '100%'; note('Download finished and saved. Now press Test Piper.'); await refresh();
+        } catch (e) { fill.style.background = '#ef4444'; note('Download failed: ' + ((e && e.message) || 'unknown') + '. Check the internet and tap Download again.'); }
+        finally { clearInterval(tick); btns.forEach(function (b) { b.disabled = false; }); }
       }; };
       $('vp-pdhi').onclick = dl('vp-phi'); $('vp-pden').onclick = dl('vp-pen');
       $('vp-ptest').onclick = async function () {
-        store(); const l = L(), id = await pPick(l); if (!id) return msg('No voice for this language.');
-        msg('Making speech with ' + id + ' ...');
-        try { if (((await P.stored()) || []).indexOf(id) < 0) return msg('Download this voice first.');
+        store(); const l = L(), id = await pPick(l), det = $('vp-pdet'), say = function (t) { det.textContent = t; msg(t); }; if (!id) return say('No voice for this language.');
+        say('Making speech with ' + id + ' ...');
+        try { if (((await P.stored()) || []).indexOf(id) < 0) return say('Download this voice first (button above).');
           const b = await pSynth(l === 'hi' ? 'नमस्ते ' + addr() + ', मैं ' + pr.name + ' हूँ। अब मेरी आवाज़ कैसी लग रही है?' : 'Hello ' + addr() + ', I am ' + pr.name + '. How does my voice sound now?', id);
-          const u = URL.createObjectURL(b), a = new Audio(u); await a.play(); msg('Piper is working.'); }
-        catch (e) { msg('Piper failed: ' + ((e && e.message) || 'unknown')); }
+          const u = URL.createObjectURL(b), a = new Audio(u); await a.play(); say('Piper is working.'); }
+        catch (e) { say('Piper failed: ' + ((e && e.message) || 'unknown')); }
       };
     })();
     if (pr.elVoice) fill([{ voice_id: pr.elVoice, name: 'Saved voice' }]);
