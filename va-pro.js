@@ -83,19 +83,39 @@
   /* ---------- Piper (free, offline neural voice; model is downloaded once and kept on the phone) ---------- */
   const PDEF = { en: 'en_US-hfc_female-medium', hi: 'hi_IN-priyamvada-medium' };
   const piper = function () { return window.RCPiper || null; };
-  /* Capacitor patches fetch() and turns binary bodies (the 60 MB model, wasm) into text. While Piper works, use the real WebView fetch. */
+  const HINDI = ['hi_IN-priyamvada-medium', 'hi_IN-rohan-medium', 'hi_IN-pratham-medium'];
+  /* The library ships an OLD hardcoded voice map without Hindi; add the Hindi voices (files live in the rhasspy repo). */
+  function ensurePaths(P) {
+    const M = P && P.PATH_MAP; if (!M) return;
+    const sample = M['en_US-hfc_female-medium'] || M[Object.keys(M)[0]] || '', ext = /\.onnx$/.test(sample) ? '.onnx' : '', lead = sample.charAt(0) === '/' ? '/' : '';
+    HINDI.forEach(function (id) { if (!M[id]) { const q = id.split('-'); try { M[id] = lead + 'hi/hi_IN/' + q[1] + '/' + q[2] + '/' + id + ext; } catch (e) { /* frozen map */ } } });
+  }
+  const HI_URL = /huggingface\.co\/[^/]+\/piper-voices\/resolve\/main\/hi\/hi_IN\//;
+  const fixUrl = function (u) { u = String(u); return HI_URL.test(u) ? u.replace(/huggingface\.co\/[^/]+\/piper-voices\//, 'huggingface.co/rhasspy/piper-voices/') : u; };
+  /* Capacitor patches BOTH fetch() and XMLHttpRequest and turns binary bodies (60 MB model, wasm) into text.
+     While Piper works we put the real WebView versions back, then restore Capacitor's. */
   async function realFetch(fn) {
-    const orig = window.fetch, real = window.CapacitorWebFetch;
-    if (real) window.fetch = real.bind(window);
-    try { return await fn(); } finally { window.fetch = orig; }
+    const of = window.fetch, rf = window.CapacitorWebFetch, X = window.CapacitorWebXMLHttpRequest, proto = window.XMLHttpRequest && window.XMLHttpRequest.prototype, orig = {};
+    try { ensurePaths(piper()); } catch (e) { /* optional */ }
+    const f = (rf || of).bind(window);
+    window.fetch = function (input, init) { if (typeof input === 'string') input = fixUrl(input); else if (input && input.url && HI_URL.test(input.url)) input = new Request(fixUrl(input.url), input); return f(input, init); };
+    if (proto) {
+      ['open', 'send', 'abort', 'setRequestHeader', 'getResponseHeader', 'getAllResponseHeaders'].forEach(function (k) { orig[k] = proto[k]; });
+      if (X) Object.keys(X).forEach(function (k) { if (typeof X[k] === 'function') proto[k] = X[k]; });
+      const ro = proto.open; proto.open = function () { const a = [].slice.call(arguments); a[1] = fixUrl(a[1]); return ro.apply(this, a); };
+    }
+    try { return await fn(); }
+    finally { window.fetch = of; if (proto) Object.keys(orig).forEach(function (k) { if (orig[k]) proto[k] = orig[k]; }); }
   }
   let pvoices = null, pwarned = '';
   const perr = function (code, m) { const e = new Error(m || code); e.pcode = code; return e; };
   async function pList() {
     if (pvoices) return pvoices;
-    const v = await realFetch(function () { return piper().voices(); });
-    pvoices = Array.isArray(v) ? v.map(function (x) { return x.key || x.id || String(x); }) : Object.keys(v || {});
-    return pvoices;
+    let arr = [];
+    try { const v = await realFetch(function () { return piper().voices(); }); arr = Array.isArray(v) ? v.map(function (x) { return x.key || x.id || String(x); }) : Object.keys(v || {}); }
+    catch (e) { arr = [PDEF.en]; }                              /* list unreachable (offline): still offer the known voices */
+    HINDI.forEach(function (id) { if (arr.indexOf(id) < 0) arr.push(id); });
+    pvoices = arr; return pvoices;
   }
   async function pPick(l) {
     const want = pr.piperVoice && pr.piperVoice[l], all = await pList();
@@ -130,7 +150,7 @@
   async function viaPiper(text, l, my) {
     if (!piper()) throw perr('missing');
     const id = await pPick(l); if (!id) throw perr('novoice');
-    const st = await piper().stored(); if ((st || []).indexOf(id) < 0) throw perr('notdownloaded');
+    const st = await piper().stored(); if ((st || []).indexOf(id) < 0) throw perr(pr.piperDone && pr.piperDone[id] ? 'lost' : 'notdownloaded');
     const ch = splitText(text); let next = pSynth(ch[0], id);
     for (let k = 0; k < ch.length; k++) {
       const cur = next; if (k + 1 < ch.length) { next = pSynth(ch[k + 1], id); next.catch(function () { /* handled when awaited */ }); }
@@ -143,6 +163,7 @@
     const hi = l !== 'en', c = e && e.pcode;
     if (c === 'missing') return hi ? 'Piper इस बिल्ड में नहीं है। फ़ोन की आवाज़ चल रही है।' : 'Piper is not in this build. Using the phone voice.';
     if (c === 'novoice') return hi ? 'इस भाषा की Piper आवाज़ लिस्ट में नहीं मिली। फ़ोन की आवाज़ चल रही है।' : 'No Piper voice found for this language. Using the phone voice.';
+    if (c === 'lost') return hi ? 'Piper आवाज़ फ़ोन की स्टोरेज से हट गई (शायद Android ने साफ़ कर दी)। ⚙ में दोबारा Download करें। तब तक फ़ोन की आवाज़ चलेगी।' : 'The Piper voice was removed from phone storage (Android may have cleared it). Open the gear and download it again.';
     if (c === 'notdownloaded') return hi ? 'Piper आवाज़ अभी डाउनलोड नहीं हुई। ⚙ खोलकर "Download" दबाइए। तब तक फ़ोन की आवाज़ चलेगी।' : 'The Piper voice is not downloaded yet. Open the gear and tap Download. Using the phone voice meanwhile.';
     return (hi ? 'Piper नहीं चल पाया' : 'Piper failed') + (e && e.message ? ' (' + e.message + ')' : '') + (hi ? '। फ़ोन की आवाज़ चल रही है।' : '. Using the phone voice.');
   }
@@ -336,7 +357,8 @@
       '<label>English voice</label><select id="vp-pen" style="width:100%;padding:10px;margin:4px 0 6px;border-radius:10px"></select><button id="vp-pden" style="width:100%;padding:10px;border-radius:10px;margin-bottom:8px">Download English voice (about 60 MB, once)</button>' +
       '<div id="vp-bar" style="height:10px;background:#374151;border-radius:6px;overflow:hidden;margin:6px 0;display:none"><div id="vp-fill" style="height:100%;width:0;background:#22c55e;transition:width .3s"></div></div>' +
       '<div id="vp-pdet" style="font-size:13px;min-height:18px;margin:2px 0 8px"></div>' +
-      '<button id="vp-ptest" style="width:100%;padding:10px;border-radius:10px">Test Piper</button></div>' +
+      '<div style="display:flex;gap:6px"><button id="vp-pthi" style="flex:1;padding:10px;border-radius:10px">Test Hindi</button><button id="vp-pten" style="flex:1;padding:10px;border-radius:10px">Test English</button></div>' +
+      '<button id="vp-pdel" style="width:100%;padding:8px;border-radius:10px;margin-top:8px;opacity:.8">Delete all downloaded voices</button></div>' +
       '<label>ElevenLabs API key</label><input id="vp-key" type="password" autocomplete="off" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px">' +
       '<label>Voice ID (optional - leave empty to use the default voice)</label><input id="vp-vid" autocomplete="off" placeholder="e.g. 21m00Tcm4TlvDq8ikWAM" style="width:100%;padding:10px;margin:4px 0 8px;border-radius:10px">' +
       '<label>Or pick from your voices</label><div style="display:flex;gap:6px;margin:4px 0 8px"><select id="vp-voice" style="flex:1;padding:10px;border-radius:10px"></select><button id="vp-load" style="padding:10px;border-radius:10px">Load</button></div>' +
@@ -374,8 +396,15 @@
     $('vp-x').onclick = function () { d.style.display = 'none'; };
     (async function piperUI() {
       const st = $('vp-pst'), P = piper();
-      if (!P) { st.textContent = 'Piper is not in this build (its optional build step did not finish). The phone voice or ElevenLabs will be used.'; ['vp-pdhi', 'vp-pden', 'vp-ptest'].forEach(function (i) { $(i).disabled = true; }); return; }
-      const refresh = async function () { try { const s2 = await P.stored(); st.textContent = 'Downloaded on this phone: ' + ((s2 && s2.length) ? s2.join(', ') : 'none yet'); } catch (e) { st.textContent = 'Could not read stored voices: ' + (e && e.message); } };
+      if (!P) { st.textContent = 'Piper is not in this build (its optional build step did not finish). The phone voice or ElevenLabs will be used.'; ['vp-pdhi', 'vp-pden', 'vp-pthi', 'vp-pten', 'vp-pdel'].forEach(function (i) { $(i).disabled = true; }); return; }
+      const refresh = async function () {
+        try {
+          const s2 = (await P.stored()) || []; let extra = '';
+          try { if (navigator.storage && navigator.storage.estimate) { const e = await navigator.storage.estimate(); extra += ' | App storage used: ' + Math.round((e.usage || 0) / 1048576) + ' MB'; } if (navigator.storage && navigator.storage.persisted) extra += ' | Kept permanently: ' + ((await navigator.storage.persisted()) ? 'yes' : 'no'); } catch (e) { /* diagnostics only */ }
+          const lost = Object.keys(pr.piperDone || {}).filter(function (k) { return s2.indexOf(k) < 0; });
+          st.textContent = 'Downloaded on this phone: ' + (s2.length ? s2.join(', ') : 'none yet') + extra + (lost.length ? ' | WARNING: earlier downloaded but now missing: ' + lost.join(', ') : '');
+        } catch (e) { st.textContent = 'Could not read stored voices: ' + (e && e.message); }
+      };
       try {
         const all = await pList(), opt = function (arr, cur) { return arr.map(function (k) { return '<option value="' + k + '"' + (k === cur ? ' selected' : '') + '>' + k.replace(/-medium|-low|-high/, '') + '</option>'; }).join(''); };
         const hi = all.filter(function (k) { return k.indexOf('hi_IN') === 0; }), en = all.filter(function (k) { return /^en_(US|GB)/.test(k); });
@@ -394,6 +423,7 @@
         try {
           if (!(navigator.storage && navigator.storage.getDirectory)) throw new Error('this phone WebView has no offline file storage (OPFS) that Piper needs');
           try { if (navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* best effort */ }
+          try { if (((await P.stored()) || []).indexOf(id) >= 0) { note('Removing the old copy of ' + id + ' first ...'); await realFetch(function () { return P.remove(id); }); } } catch (e) { /* nothing to remove */ }
           note('Starting download of ' + id + ' ...');
           await realFetch(function () { return P.download(id, function (g) {
             last = Date.now(); if (g && g.url) files[g.url] = g;
@@ -403,23 +433,32 @@
           }); });
           const stored = (await P.stored()) || [];
           if (stored.indexOf(id) < 0) throw new Error('the download ended but the voice was not saved (storage problem)');
-          fill.style.width = '100%'; note('Download finished and saved. Now press Test Piper.'); await refresh();
+          fill.style.width = '97%'; note('Downloaded. Checking that this voice can really speak ...');
+          try { await pSynth(id.indexOf('hi_') === 0 ? 'नमस्ते' : 'Hello', id); }
+          catch (e) { fill.style.background = '#ef4444'; note('Downloaded, but this voice could not speak: ' + ((e && e.message) || 'unknown') + '. Tap Delete all downloaded voices, then try again.'); await refresh(); return; }
+          pr.piperDone = pr.piperDone || {}; pr.piperDone[id] = 1; VA.savePrefs();
+          fill.style.width = '100%'; note('Ready: ' + id + ' is downloaded, saved and verified.'); await refresh();
         } catch (e) { fill.style.background = '#ef4444'; note('Download failed: ' + ((e && e.message) || 'unknown') + '. Check the internet and tap Download again.'); }
         finally { clearInterval(tick); btns.forEach(function (b) { b.disabled = false; }); }
       }; };
       $('vp-pdhi').onclick = dl('vp-phi'); $('vp-pden').onclick = dl('vp-pen');
-      $('vp-ptest').onclick = async function () {
-        store(); const l = L(), id = await pPick(l), det = $('vp-pdet'), say = function (t) { det.textContent = t; msg(t); }; if (!id) return say('No voice for this language.');
-        say('Making speech with ' + id + ' ...');
-        try { if (((await P.stored()) || []).indexOf(id) < 0) return say('Download this voice first (button above).');
-          const b = await pSynth(l === 'hi' ? 'नमस्ते ' + addr() + ', मैं ' + pr.name + ' हूँ। अब मेरी आवाज़ कैसी लग रही है?' : 'Hello ' + addr() + ', I am ' + pr.name + '. How does my voice sound now?', id);
-          const u = URL.createObjectURL(b), a = new Audio(u); await a.play(); say('Piper is working.'); }
-        catch (e) { say('Piper failed: ' + ((e && e.message) || 'unknown')); }
-      };
+      const test = function (sel, text) { return async function () {
+        store(); const id = $(sel).value, det = $('vp-pdet'), say = function (t) { det.textContent = t; msg(t); };
+        if (!id) return say('Pick a voice first.');
+        try {
+          if (((await P.stored()) || []).indexOf(id) < 0) return say('Download this voice first (button above).');
+          say('Making speech with ' + id + ' ...');
+          const b = await pSynth(text, id), a = new Audio(URL.createObjectURL(b)); await a.play(); say('Piper is speaking with ' + id + '.');
+        } catch (e) { say('Piper failed: ' + ((e && e.message) || 'unknown')); }
+      }; };
+      $('vp-pthi').onclick = test('vp-phi', 'नमस्ते ' + addr() + ', मैं ' + pr.name + ' हूँ। अब मेरी आवाज़ कैसी लग रही है?');
+      $('vp-pten').onclick = test('vp-pen', 'Hello ' + addr() + ', I am ' + pr.name + '. How does my voice sound now?');
+      $('vp-pdel').onclick = async function () { try { await realFetch(function () { return P.flush(); }); pr.piperDone = {}; pcache.clear(); VA.savePrefs(); $('vp-pdet').textContent = 'All downloaded voices deleted.'; await refresh(); } catch (e) { $('vp-pdet').textContent = 'Could not delete: ' + (e && e.message); } };
     })();
     if (pr.elVoice) fill([{ voice_id: pr.elVoice, name: 'Saved voice' }]);
   }
-  VA.proSettings = sheet;
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* best effort */ }
+  VA.proSettings = sheet; VA.proNet = realFetch;
   function btn() {
     if (document.getElementById('va-pro-btn')) return;
     const b = document.createElement('button'); b.id = 'va-pro-btn'; b.textContent = '\u2699'; b.setAttribute('aria-label', 'Voice Pro settings');
